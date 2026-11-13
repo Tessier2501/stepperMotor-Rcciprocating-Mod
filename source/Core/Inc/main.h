@@ -73,7 +73,8 @@ void Error_Handler(void);
 #define Trig_Pin GPIO_PIN_7
 #define Trig_GPIO_Port GPIOB
 /* USER CODE BEGIN Private defines */
-
+#define Origin_Pin GPIO_PIN_4
+#define Origin_GPIO_Port GPIOB
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus
