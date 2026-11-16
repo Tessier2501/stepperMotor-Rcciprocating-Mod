@@ -1,10 +1,11 @@
-﻿#include "app.h"
+﻿#include "app_core.h"
 #include "app_motion.h"
 #include "app_params.h"
-#include "main.h"
+#include "app_view.h"
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #define APP_BUTTON_DEBOUNCE_MS          20U    /* placeholder */
 #define APP_TRIG_LONG_PRESS_MS          1000U  /* placeholder */
@@ -23,24 +24,6 @@
 #define APP_HOME_SEARCH_TIMEOUT_MS      30000U /* placeholder */
 #define APP_HOME_TOP_TIMEOUT_MS         60000U /* placeholder */
 #define APP_AUTO_MOVE_TIMEOUT_MS        60000U /* placeholder */
-
-typedef enum
-{
-    APP_STATE_MANUAL = 0,
-    APP_STATE_HOMING,
-    APP_STATE_READY,
-    APP_STATE_AUTO
-} app_state_t;
-
-typedef enum
-{
-    APP_PARAM_DELAY = 0,
-    APP_PARAM_UP_SPEED,
-    APP_PARAM_DOWN_SPEED,
-    APP_PARAM_BOTTOM,
-    APP_PARAM_TOP,
-    APP_PARAM_COUNT
-} app_param_index_t;
 
 typedef enum
 {
@@ -100,6 +83,7 @@ static uint8_t s_selected_param;
 static bool s_edit_active;
 static uint8_t s_edit_index;
 static app_params_t s_edit_params;
+static app_params_t s_edit_original_params;
 static bool s_save_pending;
 static bool s_edit_error;
 static bool s_edit_move_failed;
@@ -110,20 +94,8 @@ static bool s_edit_repeat_started;
 static uint32_t s_edit_repeat_start_ms;
 static uint32_t s_edit_repeat_last_ms;
 
-static bool App_ReadUp(void)
-{
-    return HAL_GPIO_ReadPin(Up_GPIO_Port, Up_Pin) == GPIO_PIN_RESET;
-}
-
-static bool App_ReadDown(void)
-{
-    return HAL_GPIO_ReadPin(Down_GPIO_Port, Down_Pin) == GPIO_PIN_RESET;
-}
-
-static bool App_ReadTrig(void)
-{
-    return HAL_GPIO_ReadPin(Trig_GPIO_Port, Trig_Pin) == GPIO_PIN_RESET;
-}
+static app_view_state_t s_view;
+static bool s_view_valid;
 
 static void App_DebounceInit(app_debounce_t *input, bool raw, uint32_t now)
 {
@@ -151,12 +123,12 @@ static void App_DebounceUpdate(app_debounce_t *input, bool raw, uint32_t now)
     }
 }
 
-static void App_UpdateInputs(uint32_t now)
+static void App_UpdateInputs(uint32_t now, const app_input_t *input)
 {
-    App_DebounceUpdate(&s_up, App_ReadUp(), now);
-    App_DebounceUpdate(&s_down, App_ReadDown(), now);
-    App_DebounceUpdate(&s_trig, App_ReadTrig(), now);
-    App_DebounceUpdate(&s_origin, AppMotion_IsOriginActive(), now);
+    App_DebounceUpdate(&s_up, input->up_pressed, now);
+    App_DebounceUpdate(&s_down, input->down_pressed, now);
+    App_DebounceUpdate(&s_trig, input->trig_pressed, now);
+    App_DebounceUpdate(&s_origin, input->origin_active, now);
 }
 
 static bool App_OriginStableActive(void)
@@ -192,7 +164,7 @@ static int32_t App_ClampI32(int64_t value)
     return (int32_t)value;
 }
 
-static void App_StartAuto(void);
+static void App_StartAuto(uint32_t now);
 
 static void App_FinishEdit(void)
 {
@@ -222,14 +194,14 @@ static void App_FailMotion(void)
     s_state = APP_STATE_MANUAL;
 }
 
-static void App_StartHoming(void)
+static void App_StartHoming(uint32_t now)
 {
     AppMotion_Stop();
     App_FinishEdit();
     s_homed = false;
     s_homing_fault = false;
     s_state = APP_STATE_HOMING;
-    s_home_phase_start_ms = HAL_GetTick();
+    s_home_phase_start_ms = now;
 
     if (App_OriginStableActive())
     {
@@ -359,7 +331,7 @@ static void App_ProcessHoming(uint32_t now)
     }
 }
 
-static void App_StartAuto(void)
+static void App_StartAuto(uint32_t now)
 {
     const app_params_t *params = AppParams_Get();
 
@@ -371,7 +343,7 @@ static void App_StartAuto(void)
     AppMotion_Stop();
     s_state = APP_STATE_AUTO;
     s_auto_phase = APP_AUTO_MOVE_TO_TOP;
-    s_auto_phase_start_ms = HAL_GetTick();
+    s_auto_phase_start_ms = now;
 
     if (!AppMotion_StartMoveTo(params->top_pos,
                                (params->top_pos > AppMotion_GetPosition())
@@ -382,7 +354,7 @@ static void App_StartAuto(void)
     }
 }
 
-static void App_ProcessAuto(void)
+static void App_ProcessAuto(uint32_t now)
 {
     const app_params_t *params = AppParams_Get();
 
@@ -393,7 +365,7 @@ static void App_ProcessAuto(void)
     }
 
     if (s_auto_phase != APP_AUTO_DELAY &&
-        (uint32_t)(HAL_GetTick() - s_auto_phase_start_ms) >= APP_AUTO_MOVE_TIMEOUT_MS)
+        (uint32_t)(now - s_auto_phase_start_ms) >= APP_AUTO_MOVE_TIMEOUT_MS)
     {
         App_FailMotion();
         return;
@@ -414,7 +386,7 @@ static void App_ProcessAuto(void)
                     return;
                 }
                 s_auto_phase = APP_AUTO_MOVE_DOWN;
-                s_auto_phase_start_ms = HAL_GetTick();
+                s_auto_phase_start_ms = now;
             }
             else
             {
@@ -429,7 +401,7 @@ static void App_ProcessAuto(void)
             }
             if (AppMotion_TakeDone())
             {
-                s_auto_wait_until_ms = HAL_GetTick() + params->delay_ms;
+                s_auto_wait_until_ms = now + params->delay_ms;
                 s_auto_phase = APP_AUTO_DELAY;
             }
             else
@@ -439,7 +411,7 @@ static void App_ProcessAuto(void)
             break;
 
         case APP_AUTO_DELAY:
-            if ((int32_t)(HAL_GetTick() - s_auto_wait_until_ms) >= 0)
+            if ((int32_t)(now - s_auto_wait_until_ms) >= 0)
             {
                 if (!AppMotion_StartMoveTo(params->top_pos, params->up_speed_pps))
                 {
@@ -447,7 +419,7 @@ static void App_ProcessAuto(void)
                     return;
                 }
                 s_auto_phase = APP_AUTO_MOVE_UP;
-                s_auto_phase_start_ms = HAL_GetTick();
+                s_auto_phase_start_ms = now;
             }
             break;
 
@@ -495,6 +467,7 @@ static void App_StartEdit(void)
     }
 
     s_edit_params = *AppParams_Get();
+    s_edit_original_params = s_edit_params;
     s_edit_index = s_selected_param;
     s_edit_active = true;
     s_save_pending = false;
@@ -600,7 +573,12 @@ static void App_AdjustEdit(int8_t direction)
         {
             int64_t value = (int64_t)s_edit_params.bottom_pos +
                             ((int64_t)delta * APP_EDIT_POS_STEP_PULSES);
+            int64_t min_bottom = (int64_t)APP_PARAMS_MIN_BOTTOM_POS;
             int64_t max_bottom = (int64_t)s_edit_params.top_pos - 1;
+            if (value < min_bottom)
+            {
+                value = min_bottom;
+            }
             if (value > max_bottom)
             {
                 value = max_bottom;
@@ -742,15 +720,15 @@ static void App_ProcessEdit(uint32_t now)
     App_UpdateEditRepeat(now);
 }
 
-static void App_HandleLongTrig(void)
+static void App_HandleLongTrig(uint32_t now)
 {
     if (s_state == APP_STATE_MANUAL)
     {
-        App_StartHoming();
+        App_StartHoming(now);
     }
     else if (s_state == APP_STATE_READY && !s_edit_active)
     {
-        App_StartAuto();
+        App_StartAuto(now);
     }
 }
 
@@ -789,7 +767,7 @@ static void App_UpdateTrig(uint32_t now)
         s_trig_long_fired = true;
         if (App_TrigPressMatches())
         {
-            App_HandleLongTrig();
+            App_HandleLongTrig(now);
         }
     }
 
@@ -923,30 +901,65 @@ static void App_UpdateUpDown(uint32_t now)
     }
 }
 
-void App_Init(void)
+static void App_BuildView(app_view_state_t *view)
 {
-    uint32_t now;
+    memset(view, 0, sizeof(*view));
+    view->selected_param = (app_param_index_t)s_selected_param;
+    view->params = *AppParams_Get();
 
+    if (!s_homed)
+    {
+        view->screen = APP_VIEW_SCREEN_UNHOMED;
+    }
+    else if (s_edit_active)
+    {
+        view->screen = APP_VIEW_SCREEN_EDIT;
+        view->edit_param = (app_param_index_t)s_edit_index;
+        view->edit_old = s_edit_original_params;
+        view->edit_new = s_edit_params;
+    }
+    else
+    {
+        view->screen = APP_VIEW_SCREEN_MAIN;
+    }
+}
+
+static void App_UpdateView(bool force)
+{
+    app_view_state_t next;
+
+    App_BuildView(&next);
+    if (force || !s_view_valid || memcmp(&next, &s_view, sizeof(next)) != 0)
+    {
+        s_view = next;
+        s_view_valid = true;
+        AppView_Render(&s_view);
+    }
+}
+
+void AppCore_Init(uint32_t now, const app_input_t *input)
+{
     AppParams_Init();
     AppMotion_Init();
 
-    now = HAL_GetTick();
-    App_DebounceInit(&s_up, App_ReadUp(), now);
-    App_DebounceInit(&s_down, App_ReadDown(), now);
-    App_DebounceInit(&s_trig, App_ReadTrig(), now);
-    App_DebounceInit(&s_origin, AppMotion_IsOriginActive(), now);
+    App_DebounceInit(&s_up, input->up_pressed, now);
+    App_DebounceInit(&s_down, input->down_pressed, now);
+    App_DebounceInit(&s_trig, input->trig_pressed, now);
+    App_DebounceInit(&s_origin, input->origin_active, now);
 
     s_state = APP_STATE_MANUAL;
     s_homed = false;
     s_homing_fault = false;
-    s_selected_param = APP_PARAM_DELAY;
+    s_selected_param = APP_PARAM_DOWN_SPEED;
     s_edit_active = false;
-    s_edit_index = APP_PARAM_DELAY;
+    s_edit_index = APP_PARAM_DOWN_SPEED;
     s_save_pending = false;
     s_edit_error = false;
     s_edit_move_failed = false;
     s_edit_move_target_valid = false;
     s_edit_repeat_direction = 0;
+    memset(&s_edit_params, 0, sizeof(s_edit_params));
+    memset(&s_edit_original_params, 0, sizeof(s_edit_original_params));
 
     s_trig_was_pressed = s_trig.stable;
     s_trig_long_fired = false;
@@ -964,13 +977,14 @@ void App_Init(void)
     s_down_press_state = s_state;
     s_up_press_edit = false;
     s_down_press_edit = false;
+
+    s_view_valid = false;
+    App_UpdateView(true);
 }
 
-void App_Process(void)
+void AppCore_Process(uint32_t now, const app_input_t *input)
 {
-    uint32_t now = HAL_GetTick();
-
-    App_UpdateInputs(now);
+    App_UpdateInputs(now, input);
     App_UpdateUpDown(now);
     App_UpdateTrig(now);
 
@@ -980,10 +994,34 @@ void App_Process(void)
     }
     else if (s_state == APP_STATE_AUTO)
     {
-        App_ProcessAuto();
+        App_ProcessAuto(now);
     }
     else if (s_state == APP_STATE_READY && s_edit_active)
     {
         App_ProcessEdit(now);
     }
+
+    App_UpdateView(false);
+}
+
+void AppCore_OnPulse(void)
+{
+    AppMotion_OnPulse();
+}
+
+void AppCore_GetView(app_view_state_t *view)
+{
+    *view = s_view;
+}
+
+void AppCore_GetStatus(app_core_status_t *status)
+{
+    memset(status, 0, sizeof(*status));
+    status->state = s_state;
+    status->homed = s_homed;
+    status->edit_active = s_edit_active;
+    status->selected_param = (app_param_index_t)s_selected_param;
+    status->position = AppMotion_GetPosition();
+    status->moving = AppMotion_IsMoving();
+    status->jogging = AppMotion_IsJogging();
 }

@@ -1,17 +1,19 @@
 #include "app_params.h"
-#include "main.h"
+#include "app_platform.h"
 
 #include <stddef.h>
 #include <string.h>
 
 _Static_assert(sizeof(app_params_t) == 20U, "app_params_t size");
 _Static_assert(offsetof(app_params_t, valid) == 16U, "valid marker must be last word");
-_Static_assert(APP_PARAMS_FACTORY_BOTTOM_POS < APP_PARAMS_FACTORY_TOP_POS, "factory endpoints out of order");
-_Static_assert(APP_PARAMS_FACTORY_TOP_POS <= -((int32_t)APP_PARAMS_TOP_CLEARANCE_PULSES), "factory top clearance");
+_Static_assert(APP_PARAMS_FACTORY_BOTTOM_POS < APP_PARAMS_FACTORY_TOP_POS,
+               "factory endpoints out of order");
+_Static_assert(APP_PARAMS_FACTORY_BOTTOM_POS >= APP_PARAMS_MIN_BOTTOM_POS,
+               "factory bottom outside physical range");
+_Static_assert(APP_PARAMS_FACTORY_TOP_POS <= -((int32_t)APP_PARAMS_TOP_CLEARANCE_PULSES),
+               "factory top clearance");
 
-#define APP_PARAMS_FLASH_PAGE_ADDR 0x0800FC00UL
-#define APP_PARAMS_FLASH_ADDR      (APP_PARAMS_FLASH_PAGE_ADDR + 0x100UL)
-#define APP_PARAMS_VALID_MARKER    1UL
+#define APP_PARAMS_VALID_MARKER 1UL
 
 static app_params_t s_params;
 
@@ -29,6 +31,7 @@ static bool AppParams_FieldsValid(const app_params_t *params)
         return false;
     }
     if (params->top_pos > -((int32_t)APP_PARAMS_TOP_CLEARANCE_PULSES) ||
+        params->bottom_pos < APP_PARAMS_MIN_BOTTOM_POS ||
         params->bottom_pos >= params->top_pos)
     {
         return false;
@@ -47,82 +50,15 @@ static void AppParams_SetDefaults(void)
     s_params.valid = APP_PARAMS_VALID_MARKER;
 }
 
-static bool AppParams_FlashWrite(const app_params_t *params)
-{
-    uint8_t bytes[sizeof(app_params_t)];
-    uint32_t words = (uint32_t)(sizeof(bytes) / sizeof(uint32_t));
-    FLASH_EraseInitTypeDef erase = {0};
-    uint32_t page_error = 0;
-    uint32_t primask = __get_PRIMASK();
-    bool ok = true;
-
-    memset(bytes, 0, sizeof(bytes));
-    memcpy(bytes, params, sizeof(*params));
-
-    __disable_irq();
-    HAL_FLASH_Unlock();
-
-    erase.TypeErase = FLASH_TYPEERASE_PAGES;
-    erase.PageAddress = APP_PARAMS_FLASH_PAGE_ADDR;
-    erase.NbPages = 1;
-    if (HAL_FLASHEx_Erase(&erase, &page_error) != HAL_OK)
-    {
-        ok = false;
-    }
-
-    if (ok)
-    {
-        for (uint32_t i = 0; i < words; i++)
-        {
-            uint32_t word = 0;
-            memcpy(&word, &bytes[i * sizeof(uint32_t)], sizeof(word));
-            if (i == (words - 1U))
-            {
-                break;
-            }
-            if (HAL_FLASH_Program(TYPEPROGRAM_WORD,
-                                  APP_PARAMS_FLASH_ADDR + (i * sizeof(uint32_t)),
-                                  word) != HAL_OK)
-            {
-                ok = false;
-                break;
-            }
-        }
-    }
-
-    if (ok && words != 0U)
-    {
-        uint32_t word = 0;
-        memcpy(&word, &bytes[(words - 1U) * sizeof(uint32_t)], sizeof(word));
-        if (HAL_FLASH_Program(TYPEPROGRAM_WORD,
-                              APP_PARAMS_FLASH_ADDR + ((words - 1U) * sizeof(uint32_t)),
-                              word) != HAL_OK)
-        {
-            ok = false;
-        }
-    }
-
-    HAL_FLASH_Lock();
-    if ((primask & 1U) == 0U)
-    {
-        __enable_irq();
-    }
-
-    if (ok && memcmp((const void *)APP_PARAMS_FLASH_ADDR, bytes, sizeof(bytes)) != 0)
-    {
-        ok = false;
-    }
-
-    return ok;
-}
-
 void AppParams_Init(void)
 {
-    const app_params_t *stored = (const app_params_t *)APP_PARAMS_FLASH_ADDR;
+    app_params_t stored;
 
-    if (stored->valid == APP_PARAMS_VALID_MARKER && AppParams_FieldsValid(stored))
+    if (PlatformStorage_Load(&stored) &&
+        stored.valid == APP_PARAMS_VALID_MARKER &&
+        AppParams_FieldsValid(&stored))
     {
-        memcpy(&s_params, stored, sizeof(s_params));
+        s_params = stored;
     }
     else
     {
@@ -157,11 +93,66 @@ bool AppParams_Save(const app_params_t *params)
     saved = *params;
     saved.valid = APP_PARAMS_VALID_MARKER;
 
-    if (!AppParams_FlashWrite(&saved))
+    if (!PlatformStorage_Save(&saved))
     {
         return false;
     }
 
     s_params = saved;
     return true;
+}
+
+int32_t AppParams_GetValue(const app_params_t *params, app_param_index_t index)
+{
+    switch (index)
+    {
+        case APP_PARAM_DOWN_SPEED:
+            return (int32_t)params->down_speed_pps;
+        case APP_PARAM_UP_SPEED:
+            return (int32_t)params->up_speed_pps;
+        case APP_PARAM_BOTTOM:
+            return params->bottom_pos;
+        case APP_PARAM_TOP:
+            return params->top_pos;
+        case APP_PARAM_DELAY:
+            return (int32_t)params->delay_ms;
+        default:
+            return 0;
+    }
+}
+
+const char *AppParams_Label(app_param_index_t index)
+{
+    switch (index)
+    {
+        case APP_PARAM_DOWN_SPEED:
+            return "下行速度";
+        case APP_PARAM_UP_SPEED:
+            return "上行速度";
+        case APP_PARAM_BOTTOM:
+            return "下止点";
+        case APP_PARAM_TOP:
+            return "上止点";
+        case APP_PARAM_DELAY:
+            return "延时";
+        default:
+            return "";
+    }
+}
+
+const char *AppParams_Unit(app_param_index_t index)
+{
+    switch (index)
+    {
+        case APP_PARAM_DOWN_SPEED:
+        case APP_PARAM_UP_SPEED:
+            return "pps";
+        case APP_PARAM_BOTTOM:
+        case APP_PARAM_TOP:
+            return "脉冲";
+        case APP_PARAM_DELAY:
+            return "ms";
+        default:
+            return "";
+    }
 }

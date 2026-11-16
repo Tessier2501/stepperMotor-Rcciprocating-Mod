@@ -1,13 +1,11 @@
 #include "app_motion.h"
-#include "main.h"
-#include "tim.h"
+#include "app_platform.h"
 
-#define MOTION_TIMER_CLOCK_HZ       72000000UL
-#define MOTION_TIMER_ARR            99UL
-#define MOTION_START_PSC            1777UL
-#define MOTION_RAMP_POINTS          150U
-#define MOTION_RAMP_MAX_STEPS       150U
-#define ORIGIN_ACTIVE_STATE         GPIO_PIN_RESET  /* placeholder */
+#define MOTION_TIMER_CLOCK_HZ APP_MOTION_TIMER_CLOCK_HZ
+#define MOTION_TIMER_ARR      APP_MOTION_TIMER_ARR
+#define MOTION_START_PSC      APP_MOTION_START_PSC
+#define MOTION_RAMP_POINTS    150U
+#define MOTION_RAMP_MAX_STEPS 150U
 
 static const uint32_t s_ramp_psc[MOTION_RAMP_POINTS] = {1777, 1765, 1754, 1742, 1730, 1718, 1707, 1695, 1683, 1671, 1660, 1648, 1636, 1625, 1613, 1601, 1589, 1578, 1566, 1554, 1543, 1531, 1519, 1507, 1496, 1484, 1472, 1460, 1449, 1437, 1425, 1414, 1402, 1390, 1378, 1367, 1355, 1343, 1331, 1320, 1308, 1296, 1285, 1273, 1261, 1249, 1238, 1226, 1214, 1202, 1191, 1179, 1167, 1156, 1144, 1132, 1120, 1109, 1097, 1085, 1074, 1062, 1050, 1038, 1027, 1015, 1003, 991, 980, 968, 956, 945, 933, 921, 909, 898, 886, 874, 862, 851, 839, 827, 816, 804, 792, 780, 769, 757, 745, 733, 722, 710, 698, 687, 675, 663, 651, 640, 628, 616, 605, 593, 581, 569, 558, 546, 534, 522, 511, 499, 487, 476, 464, 452, 440, 429, 417, 405, 393, 382, 370, 358, 347, 335, 323, 311, 300, 288, 276, 265, 253, 241, 229, 218, 206, 194, 182, 171, 159, 147, 136, 124, 112, 100, 89, 77, 65, 53, 42, 30};
 
@@ -80,13 +78,14 @@ static void AppMotion_UpdatePsc(void)
 
     if (s_jogging || s_ramp_steps < 2U)
     {
-        htim1.Instance->PSC = s_psc_cruise;
+        PlatformMotion_SetPsc(s_psc_cruise);
         return;
     }
 
     if (s_pulse_count < s_ramp_steps)
     {
-        point = ((s_pulse_count - 1U) * (MOTION_RAMP_POINTS - 1U)) / (s_ramp_steps - 1U);
+        point = ((s_pulse_count - 1U) * (MOTION_RAMP_POINTS - 1U)) /
+                (s_ramp_steps - 1U);
     }
     else if (s_remaining_steps < s_ramp_steps)
     {
@@ -98,15 +97,14 @@ static void AppMotion_UpdatePsc(void)
         point = MOTION_RAMP_POINTS - 1U;
     }
 
-    htim1.Instance->PSC = AppMotion_RampPsc(point);
+    PlatformMotion_SetPsc(AppMotion_RampPsc(point));
 }
 
 static void AppMotion_Finish(void)
 {
     s_moving = false;
     s_jogging = false;
-    HAL_TIM_PWM_Stop_IT(&htim1, TIM_CHANNEL_1);
-    HAL_GPIO_WritePin(En_GPIO_Port, En_Pin, GPIO_PIN_RESET);
+    PlatformMotion_Stop();
     s_done = true;
 }
 
@@ -146,26 +144,19 @@ static bool AppMotion_Start(app_motion_dir_t direction,
 
     if (!jogging && steps == 0U)
     {
+        s_jogging = false;
         s_done = true;
         return true;
     }
 
-    s_moving = true;
-    HAL_GPIO_WritePin(Dir_GPIO_Port, Dir_Pin,
-                      (direction == APP_MOTION_DIR_UP) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(En_GPIO_Port, En_Pin, GPIO_PIN_SET);
-
     initial_psc = (s_ramp_steps > 0U) ? MOTION_START_PSC : s_psc_cruise;
-    htim1.Instance->PSC = initial_psc;
-    htim1.Instance->EGR = TIM_EGR_UG;
-    __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
-    __HAL_TIM_SET_COUNTER(&htim1, 0U);
-    __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_CC1);
+    s_moving = true;
 
-    if (HAL_TIM_PWM_Start_IT(&htim1, TIM_CHANNEL_1) != HAL_OK)
+    if (!PlatformMotion_Start(direction, initial_psc))
     {
         s_moving = false;
-        HAL_GPIO_WritePin(En_GPIO_Port, En_Pin, GPIO_PIN_RESET);
+        s_jogging = false;
+        PlatformMotion_Stop();
         return false;
     }
 
@@ -206,16 +197,16 @@ static bool AppMotion_StartFixedMoveTo(int32_t target_pos, uint16_t speed_pps)
 
 void AppMotion_Init(void)
 {
-    GPIO_InitTypeDef gpio = {0};
-
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    gpio.Pin = Origin_Pin;
-    gpio.Mode = GPIO_MODE_INPUT;
-    gpio.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(Origin_GPIO_Port, &gpio);
-
-    HAL_GPIO_WritePin(En_GPIO_Port, En_Pin, GPIO_PIN_RESET);
-    HAL_TIM_PWM_Stop_IT(&htim1, TIM_CHANNEL_1);
+    s_moving = false;
+    s_jogging = false;
+    s_done = false;
+    s_position = 0;
+    s_pulse_count = 0U;
+    s_remaining_steps = 0U;
+    s_ramp_steps = 0U;
+    s_psc_cruise = MOTION_START_PSC;
+    s_direction = APP_MOTION_DIR_DOWN;
+    PlatformMotion_Stop();
 }
 
 bool AppMotion_StartJog(app_motion_dir_t direction, uint16_t speed_pps)
@@ -265,21 +256,17 @@ bool AppMotion_SetTarget(int32_t target_pos, uint16_t speed_pps)
 {
     int64_t delta;
     app_motion_dir_t direction;
-    uint32_t primask;
+    uint32_t irq_state;
     bool moving;
     bool jogging;
 
-    primask = __get_PRIMASK();
-    __disable_irq();
+    irq_state = PlatformIrqSave();
     moving = s_moving;
     jogging = s_jogging;
 
     if (!moving || jogging)
     {
-        if ((primask & 1U) == 0U)
-        {
-            __enable_irq();
-        }
+        PlatformIrqRestore(irq_state);
         if (jogging)
         {
             AppMotion_Stop();
@@ -290,10 +277,7 @@ bool AppMotion_SetTarget(int32_t target_pos, uint16_t speed_pps)
     delta = (int64_t)target_pos - (int64_t)s_position;
     if (delta == 0)
     {
-        if ((primask & 1U) == 0U)
-        {
-            __enable_irq();
-        }
+        PlatformIrqRestore(irq_state);
         AppMotion_Stop();
         s_done = true;
         return true;
@@ -302,10 +286,7 @@ bool AppMotion_SetTarget(int32_t target_pos, uint16_t speed_pps)
     direction = (delta > 0) ? APP_MOTION_DIR_UP : APP_MOTION_DIR_DOWN;
     if (direction != s_direction)
     {
-        if ((primask & 1U) == 0U)
-        {
-            __enable_irq();
-        }
+        PlatformIrqRestore(irq_state);
         AppMotion_Stop();
         return AppMotion_StartFixedMoveTo(target_pos, speed_pps);
     }
@@ -316,10 +297,7 @@ bool AppMotion_SetTarget(int32_t target_pos, uint16_t speed_pps)
     }
     if (delta > UINT32_MAX)
     {
-        if ((primask & 1U) == 0U)
-        {
-            __enable_irq();
-        }
+        PlatformIrqRestore(irq_state);
         return false;
     }
 
@@ -327,29 +305,21 @@ bool AppMotion_SetTarget(int32_t target_pos, uint16_t speed_pps)
     s_ramp_steps = 0U;
     s_psc_cruise = AppMotion_PscFromPps(speed_pps);
     s_done = false;
-    htim1.Instance->PSC = s_psc_cruise;
-    if ((primask & 1U) == 0U)
-    {
-        __enable_irq();
-    }
+    PlatformMotion_SetPsc(s_psc_cruise);
+    PlatformIrqRestore(irq_state);
     return true;
 }
 
 void AppMotion_Stop(void)
 {
-    uint32_t primask = __get_PRIMASK();
+    uint32_t irq_state = PlatformIrqSave();
 
-    __disable_irq();
     s_moving = false;
     s_jogging = false;
     s_done = false;
     s_ramp_steps = 0U;
-    HAL_TIM_PWM_Stop_IT(&htim1, TIM_CHANNEL_1);
-    HAL_GPIO_WritePin(En_GPIO_Port, En_Pin, GPIO_PIN_RESET);
-    if ((primask & 1U) == 0U)
-    {
-        __enable_irq();
-    }
+    PlatformMotion_Stop();
+    PlatformIrqRestore(irq_state);
 }
 
 bool AppMotion_IsMoving(void)
@@ -376,13 +346,9 @@ int32_t AppMotion_GetPosition(void)
 
 void AppMotion_SetPosition(int32_t position)
 {
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
+    uint32_t irq_state = PlatformIrqSave();
     s_position = position;
-    if ((primask & 1U) == 0U)
-    {
-        __enable_irq();
-    }
+    PlatformIrqRestore(irq_state);
 }
 
 uint32_t AppMotion_GetPulseCount(void)
@@ -395,14 +361,9 @@ app_motion_dir_t AppMotion_GetDirection(void)
     return s_direction;
 }
 
-bool AppMotion_IsOriginActive(void)
+void AppMotion_OnPulse(void)
 {
-    return (HAL_GPIO_ReadPin(Origin_GPIO_Port, Origin_Pin) == ORIGIN_ACTIVE_STATE);
-}
-
-void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
-{
-    if (htim->Instance != TIM1 || !s_moving)
+    if (!s_moving)
     {
         return;
     }
